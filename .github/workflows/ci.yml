@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  poml-render-check:
+    name: POML render check (no API)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Render POML (should produce chat messages)
+        run: |
+          python - <<'PY'
+          from poml import poml
+          rendered = poml("example.poml", chat=True)
+          # Minimal sanity checks
+          if isinstance(rendered, list):
+              ok = all(isinstance(m, dict) and "content" in m for m in rendered)
+          else:
+              ok = bool(rendered)
+          print("Rendered type:", type(rendered).__name__)
+          assert ok, "POML did not render to a usable structure"
+          print("✅ POML render check passed")
+          PY
+
+  openai-smoke:
+    name: OpenAI smoke test (runs if secret present)
+    needs: poml-render-check
+    runs-on: ubuntu-latest
+    if: ${{ secrets.OPENAI_API_KEY != '' }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-4o-mini
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run minimal live call
+        run: |
+          python - <<'PY'
+          import os, ast
+          from openai import OpenAI
+          from poml import poml
+
+          client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+          rendered = poml("example.poml", chat=True)
+
+          def to_openai_messages(x):
+              if isinstance(x, dict) and "messages" in x:
+                  x = x["messages"]
+              if isinstance(x, list):
+                  out = []
+                  for it in x:
+                      if isinstance(it, dict) and "role" in it and "content" in it:
+                          out.append({"role": it["role"], "content": it["content"]})
+                      elif isinstance(it, str):
+                          try:
+                              d = ast.literal_eval(it)
+                              if isinstance(d, dict) and "speaker" in d and "content" in d:
+                                  role = {"human":"user","user":"user","assistant":"assistant","ai":"assistant","system":"system"}.get(str(d["speaker"]).lower(),"user")
+                                  out.append({"role": role, "content": d["content"]})
+                              else:
+                                  out.append({"role":"user","content":it})
+                          except Exception:
+                              out.append({"role":"user","content":it})
+                      else:
+                          out.append({"role":"user","content":str(it)})
+                  return out
+              if isinstance(x, str):
+                  try:
+                      d = ast.literal_eval(x)
+                      if isinstance(d, dict) and "speaker" in d and "content" in d:
+                          role = {"human":"user","user":"user","assistant":"assistant","ai":"assistant","system":"system"}.get(str(d["speaker"]).lower(),"user")
+                          return [{"role": role, "content": d["content"]}]
+                  except Exception:
+                      pass
+                  return [{"role":"user","content":x}]
+              return [{"role":"user","content":str(x)}]
+
+          messages = to_openai_messages(rendered)
+          resp = client.chat.completions.create(
+              model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+              messages=messages,
+              max_tokens=120
+          )
+          print("✅ OpenAI smoke test OK. First 120 tokens returned.")
+          PY
